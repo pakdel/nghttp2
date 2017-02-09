@@ -120,6 +120,11 @@ constexpr auto ENV_UNIX_PATH = StringRef::from_lit("NGHTTP2_UNIX_PATH");
 // descriptor.  <PATH> is a path to UNIX domain socket.
 constexpr auto ENV_ACCEPT_PREFIX = StringRef::from_lit("NGHTTPX_ACCEPT_");
 
+// This environment variable contains PID of old process.  The new
+// process is expected to send QUIT signal to old process to shut it
+// down gracefully.
+constexpr auto ENV_OLD_PID = StringRef::from_lit("NGHTTPX_PID");
+
 #ifndef _KERNEL_FASTOPEN
 #define _KERNEL_FASTOPEN
 // conditional define for TCP_FASTOPEN mostly on ubuntu
@@ -436,7 +441,8 @@ void exec_binary() {
 
   auto &listenerconf = get_config()->conn.listener;
 
-  auto envp = make_unique<char *[]>(envlen + listenerconf.addrs.size() + 1);
+  // 2 for ENV_OLD_PID and terminal nullptr.
+  auto envp = make_unique<char *[]>(envlen + listenerconf.addrs.size() + 2);
   size_t envidx = 0;
 
   std::vector<ImmutableString> fd_envs;
@@ -459,6 +465,11 @@ void exec_binary() {
     envp[envidx++] = const_cast<char *>(fd_envs.back().c_str());
   }
 
+  auto ipc_fd_str = ENV_OLD_PID.str();
+  ipc_fd_str += '=';
+  ipc_fd_str += util::utos(get_config()->pid);
+  envp[envidx++] = const_cast<char *>(ipc_fd_str.c_str());
+
   for (size_t i = 0; i < envlen; ++i) {
     auto env = StringRef{environ[i]};
     if (util::starts_with(env, ENV_ACCEPT_PREFIX) ||
@@ -466,7 +477,8 @@ void exec_binary() {
         util::starts_with(env, ENV_LISTENER6_FD) ||
         util::starts_with(env, ENV_PORT) ||
         util::starts_with(env, ENV_UNIX_FD) ||
-        util::starts_with(env, ENV_UNIX_PATH)) {
+        util::starts_with(env, ENV_UNIX_PATH) ||
+        util::starts_with(env, ENV_OLD_PID)) {
       continue;
     }
 
@@ -1051,6 +1063,17 @@ void close_unused_inherited_addr(const std::vector<InheritedAddr> &iaddrs) {
 } // namespace
 
 namespace {
+// Returns old PID from environment variable ENV_IPC_FD.
+int get_old_pid_from_env() {
+  auto s = getenv(ENV_OLD_PID.c_str());
+  if (s == nullptr) {
+    return -1;
+  }
+  return util::parse_uint(s);
+}
+} // namespace
+
+namespace {
 int create_acceptor_socket(Config *config, std::vector<InheritedAddr> &iaddrs) {
   std::array<char, STRERROR_BUFSIZE> errbuf;
   auto &listenerconf = config->conn.listener;
@@ -1255,6 +1278,8 @@ int event_loop() {
     close_unused_inherited_addr(iaddrs);
   }
 
+  auto old_pid = get_old_pid_from_env();
+
   auto loop = ev_default_loop(config->ev_loop_flags);
 
   int ipc_fd;
@@ -1273,6 +1298,12 @@ int event_loop() {
   // QUIT signal to the old process to make it shutdown gracefully.
   if (!config->pid_file.empty()) {
     save_pid();
+  }
+
+  if (old_pid != -1) {
+    LOG(NOTICE) << "Send QUIT signal to parent process to tell it that we are "
+                   "ready to server requests";
+    kill(old_pid, SIGQUIT);
   }
 
   ev_run(loop, 0);
